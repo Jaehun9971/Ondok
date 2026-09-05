@@ -1,34 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { doc, onSnapshot } from 'firebase/firestore'
+import { auth, db } from '../firebase'
+import { leaveRoom as leaveFirestoreRoom } from '../services/rooms'
+import useWebRTC from '../hooks/useWebRTC'
 
-const DEFAULT_ROOM = {
-  title: '개발 공부방',
-  isPrivate: false,
-  capacity: 6,
+function RemoteVideo({ stream }) {
+  const ref = useRef(null)
+  useEffect(() => {
+    if (ref.current) ref.current.srcObject = stream || null
+  }, [stream])
+  return stream ? <video ref={ref} autoPlay playsInline className="h-full w-full object-cover" /> : null
 }
-
-const OTHER_MEMBERS = [
-  {
-    id: 2,
-    nickname: '태영',
-    active: true,
-    studying: true,
-    todos: [
-      { id: 201, text: 'JavaScript 복습하기', minutes: 60, done: false },
-      { id: 202, text: '알고리즘 문제 풀기', minutes: 90, done: true },
-    ],
-  },
-  {
-    id: 3,
-    nickname: '민지',
-    active: true,
-    studying: false,
-    todos: [
-      { id: 301, text: '영어 단어 외우기', minutes: null, done: false },
-      { id: 302, text: '과학 보고서 작성', minutes: 120, done: false },
-    ],
-  },
-]
 
 function formatTimer(totalSeconds) {
   const hours = Math.floor(totalSeconds / 3600)
@@ -74,22 +57,22 @@ function StudyRoom() {
 
   const [settingsOpen, setSettingsOpen] = useState(true)
   const [webcamOn, setWebcamOn] = useState(false)
+  const [localStream, setLocalStream] = useState(null)
   const [cameraError, setCameraError] = useState('')
   const [seconds, setSeconds] = useState(0)
   const [running, setRunning] = useState(false)
   const [todoInput, setTodoInput] = useState('')
-  const [todos, setTodos] = useState([
-    { id: 1, text: '수학 공부하기', minutes: null, done: false },
-  ])
+  const [todos, setTodos] = useState([])
+  const [room, setRoom] = useState(null)
 
-  const [room] = useState(() => {
-    try {
-      const savedRoom = sessionStorage.getItem('ondok-selected-room')
-      return savedRoom ? JSON.parse(savedRoom) : DEFAULT_ROOM
-    } catch {
-      return DEFAULT_ROOM
-    }
-  })
+  useEffect(() => {
+    const roomId = sessionStorage.getItem('ondok-room-id')
+    if (!roomId) { navigate('/home'); return undefined }
+    return onSnapshot(doc(db, 'rooms', roomId), (snapshot) => {
+      if (!snapshot.exists()) { navigate('/home'); return }
+      setRoom({ id: snapshot.id, ...snapshot.data() })
+    })
+  }, [navigate])
 
   useEffect(() => {
     if (!running) return undefined
@@ -107,6 +90,16 @@ function StudyRoom() {
     }
   }, [])
 
+  useEffect(() => {
+    if (!webcamOn || !localStream || !videoRef.current) return
+
+    videoRef.current.srcObject = localStream
+    videoRef.current.play().catch((error) => {
+      console.error('내 카메라 재생 오류:', error)
+      setCameraError('카메라 영상을 재생하지 못했습니다. 페이지를 새로고침해주세요.')
+    })
+  }, [webcamOn, localStream])
+
   const startCamera = async () => {
     if (streamRef.current) return
 
@@ -114,7 +107,7 @@ function StudyRoom() {
       setCameraError('')
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
       streamRef.current = stream
-      if (videoRef.current) videoRef.current.srcObject = stream
+      setLocalStream(stream)
       setWebcamOn(true)
     } catch (error) {
       console.error('카메라 오류:', error)
@@ -127,6 +120,7 @@ function StudyRoom() {
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
     if (videoRef.current) videoRef.current.srcObject = null
+    setLocalStream(null)
     setWebcamOn(false)
   }
 
@@ -169,17 +163,43 @@ function StudyRoom() {
     setTodos((previous) => previous.filter((todo) => todo.id !== id))
   }
 
-  const leaveRoom = () => {
+  const handleLeaveRoom = async () => {
     stopCamera()
     setRunning(false)
-    navigate('/home')
+    try {
+      if (room?.id && auth.currentUser) await leaveFirestoreRoom(room.id, auth.currentUser.uid)
+      navigate('/home')
+    } catch (error) {
+      console.error('방 나가기 오류:', error)
+      setCameraError('방에서 나가지 못했습니다. 잠시 후 다시 시도해주세요.')
+    }
   }
 
+  const remoteStreams = useWebRTC({
+    roomId: room?.id,
+    myUid: auth.currentUser?.uid,
+    memberIds: room?.memberIds,
+    localStream,
+  })
+
+  if (!room) {
+    return <div className="app-window"><div className="window-panel flex h-full items-center justify-center text-slate-500">방 정보를 불러오는 중...</div></div>
+  }
+
+  const activeMembers = (room.memberIds || []).map((uid) => ({
+    id: uid,
+    nickname: room.memberNames?.[uid] || '온독사용자',
+    active: true,
+    me: uid === auth.currentUser?.uid,
+    studying: uid === auth.currentUser?.uid ? running : false,
+    todos: uid === auth.currentUser?.uid ? todos : [],
+    stream: remoteStreams[uid] || null,
+  }))
+
   const members = [
-    { id: 1, nickname: '나', active: true, me: true, studying: running, todos },
-    ...OTHER_MEMBERS,
+    ...activeMembers,
     ...Array.from(
-      { length: Math.max(0, room.capacity - OTHER_MEMBERS.length - 1) },
+      { length: Math.max(0, room.capacity - activeMembers.length) },
       (_, index) => ({ id: `empty-${index}`, active: false }),
     ),
   ]
@@ -204,7 +224,7 @@ function StudyRoom() {
           </div>
           <button
             type="button"
-            onClick={leaveRoom}
+            onClick={handleLeaveRoom}
             className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-50"
           >
             나가기
@@ -228,8 +248,8 @@ function StudyRoom() {
                       <span className="absolute left-3 top-3 rounded-md bg-black/50 px-2 py-1 text-xs text-white">나</span>
                     </div>
                   ) : member.active ? (
-                    <div className="flex aspect-video items-center justify-center bg-slate-800 text-center text-white">
-                      <div><div className="text-4xl">👤</div><p className="mt-2 text-sm text-slate-400">상대방 영상</p></div>
+                    <div className="flex aspect-video items-center justify-center overflow-hidden bg-slate-800 text-center text-white">
+                      {member.stream ? <RemoteVideo stream={member.stream} /> : <div><div className="text-4xl">👤</div><p className="mt-2 text-sm text-slate-400">상대방 카메라 OFF</p></div>}
                     </div>
                   ) : (
                     <div className="flex aspect-video items-center justify-center bg-slate-200 text-center">

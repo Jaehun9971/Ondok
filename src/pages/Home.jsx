@@ -1,29 +1,44 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-
-const openRooms = [
-  { id: 1, title: '자격증 공부방', currentUsers: 3, capacity: 6, isPrivate: false },
-  { id: 2, title: '개발 공부방', currentUsers: 2, capacity: 6, isPrivate: false },
-  { id: 3, title: '시험 준비방', currentUsers: 4, capacity: 6, isPrivate: false },
-]
-
-const privateRooms = [
-  { id: 4, title: '친구 스터디', currentUsers: 2, capacity: 6, isPrivate: true, code: '123456' },
-  { id: 5, title: '팀 프로젝트방', currentUsers: 3, capacity: 6, isPrivate: true, code: '654321' },
-]
+import { collection, onSnapshot, query, where } from 'firebase/firestore'
+import { onAuthStateChanged } from 'firebase/auth'
+import { auth, db } from '../firebase'
+import { findRoomByCode, joinRoom, saveSelectedRoom } from '../services/rooms'
 
 function Home() {
   const navigate = useNavigate()
   const [settingsOpen, setSettingsOpen] = useState(true)
   const [inviteCode, setInviteCode] = useState('')
   const [inviteError, setInviteError] = useState('')
+  const [openRooms, setOpenRooms] = useState([])
+  const [privateRooms, setPrivateRooms] = useState([])
+  const [loading, setLoading] = useState(true)
 
-  const selectRoom = (room) => {
-    sessionStorage.setItem('ondok-selected-room', JSON.stringify(room))
-    navigate(room.isPrivate ? '/join-room' : '/room')
+  useEffect(() => {
+    let unsubscribeOpen = () => {}
+    let unsubscribePrivate = () => {}
+    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
+      if (!user) { navigate('/login'); return }
+      unsubscribeOpen = onSnapshot(query(collection(db, 'rooms'), where('isPrivate', '==', false)), (result) => {
+      setOpenRooms(result.docs.map((item) => ({ id: item.id, ...item.data() })))
+      setLoading(false)
+      })
+      unsubscribePrivate = onSnapshot(query(collection(db, 'rooms'), where('memberIds', 'array-contains', user.uid)), (result) => {
+        setPrivateRooms(result.docs.map((item) => ({ id: item.id, ...item.data() })).filter((room) => room.isPrivate))
+      })
+    })
+    return () => { unsubscribeAuth(); unsubscribeOpen(); unsubscribePrivate() }
+  }, [navigate])
+
+  const selectRoom = async (room) => {
+    try {
+      await joinRoom(room.id, auth.currentUser)
+      saveSelectedRoom(room)
+      navigate('/room')
+    } catch (error) { setInviteError(error.message) }
   }
 
-  const joinWithInviteCode = () => {
+  const joinWithInviteCode = async () => {
     const code = inviteCode.trim()
 
     if (!code) {
@@ -31,16 +46,13 @@ function Home() {
       return
     }
 
-    const room = privateRooms.find((item) => item.code === code)
-
-    if (!room) {
-      setInviteError('존재하지 않는 방 코드입니다.')
-      return
-    }
-
-    setInviteError('')
-    sessionStorage.setItem('ondok-selected-room', JSON.stringify(room))
-    navigate('/room')
+    try {
+      const room = await findRoomByCode(code)
+      if (!room) return setInviteError('존재하지 않는 방 코드입니다.')
+      await joinRoom(room.id, auth.currentUser)
+      saveSelectedRoom(room)
+      navigate('/room')
+    } catch (error) { setInviteError(error.message) }
   }
 
   const renderRooms = (rooms) => (
@@ -51,7 +63,7 @@ function Home() {
             <p className="font-semibold text-slate-800">{room.isPrivate && '🔒 '}{room.title}</p>
             <span className="text-sm text-slate-400">{room.currentUsers} / {room.capacity}</span>
           </div>
-          <p className="mt-2 text-sm text-slate-400">{room.isPrivate ? '비밀번호 입력 후 입장' : '클릭하여 바로 입장'}</p>
+          <p className="mt-2 text-sm text-slate-400">클릭하여 바로 입장</p>
         </button>
       ))}
     </div>
@@ -62,12 +74,12 @@ function Home() {
       <div className="window-panel mx-auto flex overflow-hidden">
         <section className={`border-r border-slate-200 p-8 transition-all duration-300 ${settingsOpen ? 'w-[34%]' : 'w-1/2'}`}>
           <h2 className="mb-8 text-center text-xl font-bold text-slate-800">오픈 방</h2>
-          {renderRooms(openRooms)}
+          {loading ? <p className="text-center text-sm text-slate-400">불러오는 중...</p> : openRooms.length ? renderRooms(openRooms) : <p className="text-center text-sm text-slate-400">생성된 오픈 방이 없습니다.</p>}
         </section>
 
         <section className={`border-r border-slate-200 p-8 transition-all duration-300 ${settingsOpen ? 'w-[34%]' : 'flex-1'}`}>
           <h2 className="mb-8 text-center text-xl font-bold text-slate-800">비밀 방</h2>
-          {renderRooms(privateRooms)}
+          {privateRooms.length ? renderRooms(privateRooms) : <p className="text-center text-sm text-slate-400">참여 중인 비밀 방이 없습니다.</p>}
         </section>
 
         <button type="button" onClick={() => setSettingsOpen((previous) => !previous)} aria-label={settingsOpen ? '개인 설정 접기' : '개인 설정 펼치기'} className="flex w-12 items-center justify-center border-r border-slate-200 bg-slate-50 text-2xl font-bold text-slate-500 transition hover:bg-slate-100">
