@@ -1,90 +1,133 @@
-# 온독 Firebase 백엔드
+# 온독 백엔드 구조
 
-기존 React 소스와 분리된 Firebase 백엔드입니다. 방과 참여자에 대한 쓰기는 Cloud Functions만 수행하며, 클라이언트는 허용된 데이터만 Firestore에서 실시간 구독합니다.
+백엔드는 현재 프론트에서 사용하는 방 데이터 형식을 기준으로 구성한다. 방 생성, 입장, 퇴장과 접속 인원 변경은 Cloud Functions만 수행하며 클라이언트의 직접 쓰기는 Firestore Security Rules에서 차단한다.
 
-## 구성과 컬렉션
-
-- Firebase Authentication: Google 로그인 및 향후 Naver Custom Token 로그인
-- Cloud Firestore: 사용자, 할 일, 방, 참여자 상태
-- Cloud Functions (`asia-northeast3`): 방 생성, 입장, 퇴장과 상태 검증
-- Firebase Emulator Suite: 로컬 Auth, Firestore, Functions 테스트
+## 방 데이터 계약
 
 ```text
-users/{uid}
-users/{uid}/todos/{todoId}
 rooms/{roomId}
+  title: string
+  isPrivate: boolean
+  code: string | null
+  capacity: number
+  currentUsers: number
+  ownerId: uid
+  memberIds: uid[]
+  memberNames: { [uid]: nickname }
+  status: "open"
+  createdAt: timestamp
+  updatedAt: timestamp
+
 rooms/{roomId}/members/{uid}
-roomInvites/{sha256(inviteCode)}   # 서버 전용
+  uid: string
+  nickname: string
+  photoURL: string | null
+  studying: boolean
+  cameraEnabled: boolean
+  timerStartedAt: timestamp | null
+  accumulatedSeconds: number
+  joinedAt: timestamp
+  lastSeenAt: timestamp
 ```
 
-`roomInvites`에는 초대 코드 원문을 저장하지 않으며 Security Rules가 클라이언트 접근을 모두 거부합니다.
+`memberIds`, `memberNames`, `currentUsers`는 기존 프론트 화면과 호환되는 요약 필드다. 세부 접속 상태와 heartbeat는 `members` 하위 컬렉션에 저장한다.
 
-## Callable API
+## Callable Functions
 
-모든 함수는 로그인된 Firebase 사용자를 요구합니다.
+모든 Callable Function은 Firebase 로그인이 필요하다.
+
+### `upsertProfile`
 
 ```js
-// 사용자 프로필 생성 또는 갱신
-upsertProfile({ nickname: '온독사용자' })
-
-// 방 생성. private일 때만 inviteCode가 반환된다.
-createRoom({
-  title: '개발 공부방',
-  type: 'private',
-  capacity: 6,
-  nickname: '온독사용자',
-}) // => { roomId, inviteCode }
-
-// 공개방 또는 비공개방 입장
-joinRoom({ roomId: 'firestore-room-id', nickname: '온독사용자' })
-joinRoom({ inviteCode: '123456', nickname: '온독사용자' })
-
-// 참여자 상태와 서버 기준 타이머 갱신
-updateMemberStatus({
-  roomId: 'firestore-room-id',
-  studying: true,
-  cameraEnabled: false,
-  timerStartedAt: 'now',
-  accumulatedSeconds: 0,
-})
-
-// 방 퇴장. 방장이 나가면 방을 닫는다.
-leaveRoom({ roomId: 'firestore-room-id' })
+{ nickname: '온독사용자' }
 ```
 
-타이머를 멈출 때 `timerStartedAt: null`과 계산한 누적 초를 전달합니다.
+### `createRoom`
 
-## 로컬 실행
+```js
+{
+  title: '개발 공부방',
+  isPrivate: true,
+  capacity: 6,
+  nickname: '온독사용자'
+}
+```
+
+응답:
+
+```js
+{ room: { id, title, isPrivate, code, capacity, currentUsers, ownerId, memberIds, memberNames, status } }
+```
+
+### `joinRoom`
+
+```js
+// 공개방
+{ roomId: 'room-id', nickname: '온독사용자' }
+
+// 비공개방
+{ inviteCode: '123456', nickname: '온독사용자' }
+```
+
+응답은 `{ room }`이다. 비공개방 코드는 서버의 해시 매핑으로 찾으며 정원 검사는 transaction 안에서 처리한다.
+
+### `updateMemberStatus`
+
+```js
+{
+  roomId: 'room-id',
+  studying: true,
+  cameraEnabled: false,
+  timerStartedAt: 'now', // 중지할 때 null
+  accumulatedSeconds: 120
+}
+```
+
+이 함수는 heartbeat 역할도 하므로 스터디룸에 머무는 동안 30초 간격으로 호출한다.
+
+### `leaveRoom`
+
+```js
+{ roomId: 'room-id' }
+```
+
+남은 사용자가 없으면 방과 초대 코드 매핑을 삭제한다. 방장이 먼저 나가면 남은 참여자 중 첫 번째 사용자에게 방장을 이전한다.
+
+### `cleanupStaleMembers`
+
+5분마다 실행되는 예약 함수다. `lastSeenAt`이 2분 이상 갱신되지 않은 사용자를 방에서 제거하고 `currentUsers`를 복구한다.
+
+## 보안 정책
+
+- 공개방: 로그인 사용자만 읽기 가능
+- 비공개방: 참여자만 읽기 가능
+- 방 생성·수정·삭제: Admin SDK/Functions 전용
+- 참여자 상태 쓰기: Functions 전용
+- 개인 프로필과 할 일: 본인만 접근 가능
+- WebRTC call: 같은 방의 해당 두 참여자만 접근 가능
+- 초대 코드 해시 매핑: Admin SDK 전용
+
+## 로컬 검사
 
 ```powershell
-npx firebase-tools login
 cd functions
 npm install
+npm run check
 npm test
 cd ..
+$env:FUNCTIONS_DISCOVERY_TIMEOUT='30'
 npx firebase-tools emulators:start
 ```
 
-Emulator UI는 `http://localhost:4000`에서 확인할 수 있습니다.
+Windows에서 Functions 탐색이 10초 안에 끝나지 않는 경우를 고려해 로컬 실행 시 탐색 제한을 30초로 설정한다. `firebase.json`은 예약 함수 테스트를 위한 Pub/Sub Emulator도 함께 실행한다.
 
 ## 배포
 
-Firebase Console에서 Firestore 데이터베이스를 먼저 생성한 뒤 실행합니다.
+예약 함수와 Functions 배포에는 Firebase 프로젝트의 결제 설정이 필요할 수 있다. 프론트 통합이 끝난 뒤 배포한다.
 
 ```powershell
-npx firebase-tools login
-npx firebase-tools use ondok-6d0f5
-npx firebase-tools deploy --only firestore,functions
+npm run build
+npx firebase-tools deploy --only firestore,functions,hosting
 ```
 
-배포 전에 Firebase 프로젝트의 요금제와 Cloud Functions 사용 가능 여부를 확인해야 합니다.
-
-## 이후 프론트 연결 지점
-
-- `Home.jsx`: 공개방 `rooms` 쿼리 구독
-- `CreateRoom.jsx`: `createRoom` 호출
-- `JoinRoom.jsx`: `joinRoom` 호출
-- `StudyRoom.jsx`: `rooms/{roomId}/members` 구독 및 상태 함수 호출
-- 개인 할 일: `users/{uid}/todos` 읽기와 쓰기
-
-현재 요청에 따라 기존 `src` 파일은 변경하지 않았습니다.
+`firebase.json`에는 Vite의 `dist`를 배포하고 React Router 요청을 `index.html`로 보내는 Hosting 설정이 포함되어 있다.

@@ -9,17 +9,17 @@ import {
   normalizeRoomInput,
 } from '../src/validation.js'
 
-test('normalizes valid room input', () => {
-  assert.deepEqual(normalizeRoomInput({ title: '  집중방  ', type: 'open', capacity: '6' }), {
+test('normalizes valid room input using the frontend room contract', () => {
+  assert.deepEqual(normalizeRoomInput({ title: '  집중방  ', isPrivate: false, capacity: '6' }), {
     title: '집중방',
-    type: 'open',
+    isPrivate: false,
     capacity: 6,
   })
 })
 
 test('rejects invalid capacity', () => {
   assert.throws(
-    () => normalizeRoomInput({ title: '방', type: 'open', capacity: 7 }),
+    () => normalizeRoomInput({ title: '방', isPrivate: false, capacity: 7 }),
     /invalid-capacity/,
   )
 })

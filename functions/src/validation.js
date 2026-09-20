@@ -1,23 +1,21 @@
 import { createHash, randomInt } from 'node:crypto'
 
-export const ROOM_TYPES = new Set(['open', 'private'])
-
 export function normalizeRoomInput(data = {}) {
   const title = typeof data.title === 'string' ? data.title.trim() : ''
-  const type = data.type
+  const isPrivate = data.isPrivate
   const capacity = Number(data.capacity)
 
   if (title.length < 1 || title.length > 40) {
     throw new Error('invalid-title')
   }
-  if (!ROOM_TYPES.has(type)) {
+  if (typeof isPrivate !== 'boolean') {
     throw new Error('invalid-room-type')
   }
   if (!Number.isInteger(capacity) || capacity < 2 || capacity > 6) {
     throw new Error('invalid-capacity')
   }
 
-  return { title, type, capacity }
+  return { title, isPrivate, capacity }
 }
 
 export function normalizeNickname(value) {
